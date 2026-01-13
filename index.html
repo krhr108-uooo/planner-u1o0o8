@@ -3,7 +3,6 @@
 <head>
   <link rel="manifest" href="manifest.webmanifest">
   <script src="https://accounts.google.com/gsi/client" async defer></script>
-  <script src="https://apis.google.com/js/api.js"></script>
 
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -1111,6 +1110,7 @@ backdrop.classList.add("show");
               <button class="btn" id="reset">모든 데이터 초기화</button>
 	<button onclick="googleLogin()">구글 로그인</button>
 	<button onclick="saveToDrive()">저장</button>
+	<div id="syncStatus" style="font-size:12px; color:#666; margin-top:8px;"></div>
             </div>
           </div>
         </div>    
@@ -1544,74 +1544,91 @@ const SCOPES = "https://www.googleapis.com/auth/drive.file";
 let accessToken = null;
 let driveFileId = null;
 
-// 로그인
+function setStatus(msg){
+  const el = document.getElementById("syncStatus");
+  if(el) el.textContent = msg;
+}
+
+// 1) 로그인
 function googleLogin() {
-  google.accounts.oauth2.initTokenClient({
+  setStatus("로그인 중...");
+  const tc = google.accounts.oauth2.initTokenClient({
     client_id: CLIENT_ID,
     scope: SCOPES,
-    callback: (tokenResponse) => {
-      accessToken = tokenResponse.access_token;
-      gapi.client.setToken(tokenResponse);
-      initDriveFile();
-    }
-  }).requestAccessToken();
-}
-
-// Drive 초기화
-function initDriveFile() {
-  gapi.client.load("drive", "v3", async () => {
-    const res = await gapi.client.drive.files.list({
-      q: "name='planner.json'",
-      fields: "files(id,name,modifiedTime)"
-    });
-
-    if (res.result.files.length > 0) {
-      driveFileId = res.result.files[0].id;
-      loadFromDrive();
-    } else {
-      createDriveFile();
+    callback: async (resp) => {
+      if (!resp || !resp.access_token) {
+        setStatus("로그인 실패");
+        return;
+      }
+      accessToken = resp.access_token;
+      setStatus("드라이브 연결 중...");
+      await initDriveFile();
+      setStatus("연결 완료");
     }
   });
+  tc.requestAccessToken();
 }
 
-// 파일 생성
-function createDriveFile() {
-  const content = JSON.stringify({ updatedAt: Date.now(), data: window.appData });
-  const blob = new Blob([content], { type: "application/json" });
-
-  const form = new FormData();
-  form.append("metadata", new Blob([JSON.stringify({
-    name: "planner.json",
-    mimeType: "application/json"
-  })], { type: "application/json" }));
-  form.append("file", blob);
-
-  fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", {
-    method: "POST",
-    headers: { Authorization: "Bearer " + accessToken },
-    body: form
-  }).then(r => r.json()).then(d => {
-    driveFileId = d.id;
-  });
-}
-
-// 불러오기
-function loadFromDrive() {
-  fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`, {
+// 2) Drive에서 planner.json 찾기(없으면 생성)
+async function initDriveFile(){
+  const q = encodeURIComponent("name='planner.json' and trashed=false");
+  const r = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)`, {
     headers: { Authorization: "Bearer " + accessToken }
-  })
-  .then(r => r.json())
-  .then(json => {
-    window.appData = json.data;
-    renderAll();
   });
+  const j = await r.json();
+  if (j.files && j.files.length>0){
+    driveFileId = j.files[0].id;
+    await loadFromDrive();
+  } else {
+    await createDriveFile();
+  }
 }
 
-// 저장
-function saveToDrive() {
-  const content = JSON.stringify({ updatedAt: Date.now(), data: window.appData });
+// 3) 생성
+async function createDriveFile(){
+  const content = JSON.stringify({ updatedAt: Date.now(), data: window.appData || {} });
+  const boundary = "-------314159265358979323846";
+  const metadata = { name:"planner.json", mimeType:"application/json" };
 
-  fetch(`https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=media`, {
+  const body =
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
+    JSON.stringify(metadata) + `\r\n` +
+    `--${boundary}\r\nContent-Type: application/json\r\n\r\n` +
+    content + `\r\n` +
+    `--${boundary}--`;
+
+  const r = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + accessToken,
+      "Content-Type": "multipart/related; boundary=" + boundary
+    },
+    body
+  });
+  const j = await r.json();
+  driveFileId = j.id;
+}
+
+// 4) 불러오기
+async function loadFromDrive(){
+  if(!driveFileId) return;
+  const r = await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`, {
+    headers: { Authorization: "Bearer " + accessToken }
+  });
+  const j = await r.json();
+  if(j && j.data){
+    window.appData = j.data;
+    if(typeof renderAll === "function") renderAll();
+  }
+}
+
+// 5) 저장
+async function saveToDrive(){
+  if(!driveFileId || !accessToken) { setStatus("로그인 필요"); return; }
+  setStatus("저장 중...");
+  const content = JSON.stringify({ updatedAt: Date.now(), data: window.appData || {} });
+
+  await fetch(`https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=media`, {
     method: "PATCH",
     headers: {
       Authorization: "Bearer " + accessToken,
@@ -1619,13 +1636,15 @@ function saveToDrive() {
     },
     body: content
   });
+  setStatus("저장 완료");
 }
 
-// 30초마다 반영
-setInterval(() => {
-  if (driveFileId && accessToken) loadFromDrive();
+// 6) 30초 반영
+setInterval(()=>{
+  if(accessToken && driveFileId) loadFromDrive();
 }, 30000);
 </script>
+
 
 </body>
 </html>
